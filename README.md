@@ -32,41 +32,63 @@ python -m pytest gtm_pipeline_test.py # also works if pytest is installed
 
 A change is "done" when the tests pass, not when the code merely runs.
 
-## How it works
+## Architecture Overview
 
-| Stage | What it does |
-| --- | --- |
-| **Planner** (`plan_brief`) | Turns the seller + prospect into a *brief*: what the pitch must include, what it must avoid, and the criteria it is judged against. |
-| **Generator** (`generate_draft`) | Writes a pitch draft against the brief. Two implementations behind one interface (see below). |
-| **Evaluator** (`evaluate_draft`) | Scores the draft against five hard-threshold criteria with specific, evidence-backed feedback. |
-| **Loop** (`run_pipeline`) | Feeds a failed draft's feedback back to the generator and retries, up to `max_rounds`. |
+```mermaid
+graph TD
+    Inputs([Seller + Target Prospect]) --> Planner[Planner: plan_brief]
+    Planner -->|Brief| Generator[Generator: generate_draft]
+    Generator -->|Draft| Evaluator[Evaluator: evaluate_draft]
+    Evaluator -->|All 5 criteria pass| Final([Approved pitch: safe to send])
 
-### Evaluator criteria
+    subgraph Revision Loop
+        Evaluator -->|Any criterion fails: specific feedback| Generator
+    end
 
-Each is a pass/fail hard threshold; all must pass for a draft to be approved:
+    subgraph Generator Implementations
+        Mock[Mock: composes from Brief, injects demo defects]
+        Live[Live: real Claude call, revises from feedback]
+    end
+    Generator -.-> Mock
+    Generator -.-> Live
+```
 
-1. **Personalization** — names the prospect and references their stated situation.
-2. **Factual grounding** — no invented products or unverifiable statistics (the hallucination guard).
-3. **Correct offering** — pitches the seller's actual product.
-4. **Call to action** — ends with a concrete next step.
-5. **Format** — has a subject line and stays within the word budget.
+The generator and evaluator are deliberately separate: the agent that writes the
+pitch does not get to approve its own work.
 
-### Generator: mock vs live
+### 1. Planner (`gtm_pipeline.py`)
 
-- **Mock (default):** composes a pitch from the brief and can inject known
-  defects per scenario, so the evaluator has something real to catch and the
-  loop has something to fix. Deterministic — reliable for demos and tests.
-- **Live (behind a flag):** a real Claude call writes the pitch and the
-  evaluator judges its actual, unpredictable output. Enable with the
-  **Use live agent** toggle after:
+- Takes the seller (company, product, value proposition) and the target prospect (name, description).
+- Produces a `Brief`: the must-include list, the must-avoid list, grounding keywords, and the criteria the draft is judged against.
+- A pure function of the inputs — no model call.
 
-  ```bash
-  pip install anthropic
-  setx ANTHROPIC_API_KEY "sk-ant-..."   # then reopen the terminal
-  ```
+### 2. Generator (`gtm_pipeline.py`)
 
-  Model defaults to `claude-sonnet-4-6` (override with the `GTM_MODEL` env var).
-  If the key or SDK is missing, the app falls back to the mock automatically.
+- Writes a pitch `Draft` against the `Brief`. One interface, two implementations:
+  - **Mock (default):** composes the pitch deterministically from the brief and can inject known defects per scenario, so the evaluator has something real to catch and the loop something to fix. Reliable for demos and tests.
+  - **Live (behind a flag):** a real Claude call writes the pitch and, on a revision, receives the previous draft plus the evaluator's feedback. Enable the **Use live agent** toggle after:
+
+    ```bash
+    pip install anthropic
+    setx ANTHROPIC_API_KEY "sk-ant-..."   # then reopen the terminal
+    ```
+
+    Model defaults to `claude-sonnet-4-6` (override with `GTM_MODEL`). If the key or SDK is missing, it falls back to the mock automatically.
+
+### 3. Evaluator (`gtm_pipeline.py`)
+
+- Scores the draft against five hard-threshold criteria, each pass/fail with specific, evidence-backed feedback. All must pass for a draft to be approved:
+  1. **Personalization** — names the prospect and references their stated situation.
+  2. **Factual grounding** — no invented products or unverifiable statistics (the hallucination guard).
+  3. **Correct offering** — pitches the seller's actual product.
+  4. **Call to action** — ends with a concrete next step.
+  5. **Format** — has a subject line and stays within the word budget.
+- The generator gets no vote; the evaluator alone decides whether a draft is done.
+
+### 4. Feedback loop (`gtm_pipeline.py`)
+
+- `run_pipeline` runs the Planner once, then cycles Generator → Evaluator each round.
+- On failure, the evaluator's feedback is carried back to the generator through the round history; on success (or at `max_rounds`), the loop stops.
 
 ## Files
 
