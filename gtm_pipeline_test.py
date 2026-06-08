@@ -133,6 +133,27 @@ def test_mock_draft_is_tagged_as_mock():
     assert draft.source == "mock"
 
 
+def test_live_call_failure_falls_back_to_mock():
+    # If the live agent is "available" but the call itself raises, the pipeline
+    # must degrade to the mock and record why -- never crash the app.
+    brief = _brief()
+    orig_available, orig_live = p.live_generation_available, p._live_generate
+
+    def boom(_brief, _history):
+        raise RuntimeError("simulated API failure")
+
+    p.live_generation_available = lambda: (True, "")
+    p._live_generate = boom
+    try:
+        draft = p.generate_draft(brief, [], "Clean draft (passes first round)", use_live=True)
+    finally:
+        p.live_generation_available, p._live_generate = orig_available, orig_live
+
+    assert draft.source.startswith("mock")
+    assert "live call failed" in draft.source
+    assert "Sandman" in draft.text  # still a valid draft
+
+
 def test_loop_converges_when_all_flaws_present():
     _, rounds = _run("All three flaws at once")
     assert rounds[0][1].passed is False

@@ -183,10 +183,17 @@ def generate_draft(brief, history, scenario, use_live=False):
 
     Dispatches to the live agent when `use_live` is set and it is actually
     available (API key + SDK present); otherwise falls back to the mock so the
-    demo never breaks.
+    demo never breaks. If the live call itself fails (bad key, rate limit,
+    network), it also falls back to the mock and records why, rather than
+    crashing the app.
     """
     if use_live and live_generation_available()[0]:
-        return _live_generate(brief, history)
+        try:
+            return _live_generate(brief, history)
+        except Exception as exc:  # noqa: BLE001 - any live failure must degrade gracefully
+            draft = _mock_generate(brief, scenario, history)
+            draft.source = f"mock (live call failed: {type(exc).__name__})"
+            return draft
     return _mock_generate(brief, scenario, history)
 
 
@@ -202,10 +209,12 @@ def live_generation_available():
 
 
 _LIVE_SYSTEM = (
-    "You are an SDR writing concise, personalized B2B cold outreach. "
-    "Pitch only the named product. Never invent statistics or mention any other "
-    f"product. Keep the email under {MAX_WORDS} words and end with one concrete "
-    "call to action. Output only the email, starting with 'Subject:'."
+    "You are a senior SDR writing concise, personalized B2B cold outreach. "
+    "Ground every line in the specific facts you are given about the prospect; "
+    "do not generalize. Pitch ONLY the named product. Never invent statistics, "
+    "customer counts, or capabilities, and never mention any other product. Keep "
+    f"the email under {MAX_WORDS} words and end with one concrete call to action. "
+    "Output only the email itself, starting with 'Subject:'. No preamble, no notes."
 )
 
 
@@ -244,6 +253,7 @@ def _live_generate(brief, history):
     message = client.messages.create(
         model=LIVE_MODEL,
         max_tokens=600,
+        temperature=0.7,  # natural-sounding copy, still grounded by the system prompt
         # Cache the static system prompt across rounds and prospects.
         system=[{"type": "text", "text": _LIVE_SYSTEM,
                  "cache_control": {"type": "ephemeral"}}],

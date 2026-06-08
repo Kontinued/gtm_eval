@@ -34,10 +34,12 @@ company_description = st.text_area(
         "waste hours manually checking emails for container status updates."
     ),
 )
-use_live = st.toggle("Use live agent (real Claude call)", value=False)
 live_ok, live_reason = pipeline.live_generation_available()
+use_live = st.toggle("Use live agent (real Claude call)", value=live_ok)
 if use_live and not live_ok:
     st.info(f"Live agent unavailable ({live_reason}). Falling back to the mock.")
+elif live_ok:
+    st.caption(f"Live agent ready ({pipeline.LIVE_MODEL}).")
 
 scenario = st.selectbox(
     "Generator scenario (mock only)", list(pipeline.SCENARIOS.keys()),
