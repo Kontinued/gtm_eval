@@ -43,11 +43,10 @@ MAX_WORDS = 180
 # Planner, Evaluator, or loop.
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", os.environ.get("GTM_MODEL", "gemini-2.5-flash"))
 
-# Deliberately fictional stand-ins for "a product that isn't yours", so the
-# Evaluator has a wrong-product to flag (mainly relevant to the live agent, which
-# could name a competitor). Kept obviously fake to avoid colliding with real
-# internal names/codenames (e.g. the "prairie" repo).
-DEMO_WRONG_PRODUCTS = ["Globex Analytics", "Initech Suite", "Acme Cloud"]
+# The Evaluator flags any of these as a hallucinated/confused product. Kept
+# obviously fake so they never collide with real internal names (e.g. the
+# 'prairie' repo) and aren't common words that could false-positive ('sandbox').
+DEMO_WRONG_PRODUCTS = ["Sandcastle", "Driftwave", "Lumenza"]
 
 # Words shorter than this are too generic to count as "referencing the meeting".
 _MIN_KEYWORD_LEN = 5
