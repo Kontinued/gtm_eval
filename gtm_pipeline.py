@@ -1,31 +1,33 @@
-"""Planner -> Generator -> Evaluator pipeline for GTM outreach.
+"""Planner -> Generator -> Evaluator pipeline for post-meeting client memos.
 
 This is the logic layer. It has no Streamlit dependency so it can be unit
 tested and reused. The UI (gtm_eval_ui.py) is a thin layer over these functions.
 
-Three roles, one straight line:
+The task: after a booked meeting, draft the follow-up memo to the client
+(recap + agreed next steps) and run it through a strict evaluator checkpoint
+before it is sent. Three roles, one straight line:
 
-  Planner    Expands a seller and a target prospect into a pitch brief: what
-             the pitch must include, what it must avoid, and the criteria it
-             will be judged against.
+  Planner    Turns the meeting (your company, the client, and the meeting
+             notes) into a brief: what the memo must include, what it must
+             avoid, and the criteria it is judged against.
 
-  Generator  Writes a pitch draft against the brief. Two implementations behind
-             one interface: a deterministic MOCK (default, used for demos and
-             tests) and a LIVE agent (a real Claude call, enabled by a flag).
-             The Evaluator and the loop do not care which one ran.
+  Generator  Writes the memo against the brief. Two implementations behind one
+             interface: a deterministic MOCK (default, for demos and tests) and
+             a LIVE agent (a real Claude call, enabled by a flag).
 
-  Evaluator  Scores the draft against the brief's criteria, each with a hard
-             threshold. If any point in the criteria fails, the draft is
-             rejected with specific feedback. The Evaluator, not the Generator,
-             decides whether a draft is done.
+  Evaluator  Scores the memo against five hard-threshold criteria. The most
+             important one is grounding: a client memo must not invent
+             commitments, dates, or figures that were not in the meeting. The
+             Evaluator, not the Generator, decides whether the memo can be sent.
 
-The Generator and Evaluator are deliberately separate: the agent that writes the
-pitch does not get to approve its own work. When a draft fails, the Evaluator's
-feedback is handed back to the Generator (via the round history), which revises
-and resubmits, until the draft passes or the round limit is hit.
+When a memo fails, the Evaluator's feedback is handed back to the Generator (via
+the round history), which revises and resubmits, until it passes or the round
+limit is hit. Every evaluation emits a DecisionTrace -- the durable record that
+feeds the context graph.
 
-State objects (Brief, Draft, Evaluation) are explicit dataclasses so the
-pipeline state is easy to inspect and to line up against another implementation.
+For this task the meeting notes are a real source of truth, so ground() actually
+checks the memo's figures against the notes; grounding against the wider context
+graph is still deferred (see ground()).
 """
 
 from dataclasses import dataclass, asdict
@@ -33,45 +35,42 @@ from datetime import datetime, timezone
 import os
 import re
 
-# A pitch must stay tight. The Evaluator enforces this as a hard threshold.
-MAX_WORDS = 130
+# A client memo can run a little longer than a cold email, but not by much.
+MAX_WORDS = 180
 
 # Default model for the live generator. Override with the GTM_MODEL env var.
 LIVE_MODEL = os.environ.get("GTM_MODEL", "claude-sonnet-4-6")
 
-# Demo-only stand-ins for "a product that isn't the seller's". The mock
-# Generator injects one of these as a hallucination; the Evaluator flags the
-# same set. With a live generator and a real source of truth, this is replaced
-# by checking claims against approved facts (see PROGRESS.md / AGENTS.md).
+# Demo-only stand-ins for "a product that isn't yours". The mock injects one as
+# a hallucination; the Evaluator flags the same set.
 DEMO_WRONG_PRODUCTS = ["Prairie", "Sandstorm", "Sandbox"]
 
-# Words shorter than this are too generic to count as "referencing the context".
+# Words shorter than this are too generic to count as "referencing the meeting".
 _MIN_KEYWORD_LEN = 5
 _STOPWORDS = {"their", "there", "about", "these", "those", "which", "would",
-              "could", "every", "while", "still", "thing", "things"}
+              "could", "every", "while", "still", "thing", "things", "today",
+              "great", "really", "thanks"}
 
 # The defect ids the mock Generator knows how to inject (and later remove).
-DEFECT_GENERIC = "generic"
-DEFECT_HALLUCINATION = "hallucinated_product"
-DEFECT_WEAK_CTA = "weak_cta"
+DEFECT_GENERIC = "generic"            # ignores the meeting, generic filler
+DEFECT_FABRICATION = "fabrication"    # invents a commitment/figure not in notes
+DEFECT_NO_NEXTSTEPS = "no_next_steps"  # drops the agreed next steps
 
 # Maps a failed Evaluator criterion back to the defect the mock should fix.
-# This is how the mock's feedback loop converges: a flagged criterion tells the
-# Generator exactly which defect to remove on the next round.
 _CRITERION_TO_DEFECT = {
-    "personalization": DEFECT_GENERIC,
-    "factual_grounding": DEFECT_HALLUCINATION,
-    "call_to_action": DEFECT_WEAK_CTA,
+    "grounded_in_meeting": DEFECT_GENERIC,
+    "no_fabrication": DEFECT_FABRICATION,
+    "next_steps": DEFECT_NO_NEXTSTEPS,
 }
 
 # Named demo scenarios -> the defects the mock Generator starts with. These only
 # affect the mock; the live agent writes freely and the Evaluator judges it.
 SCENARIOS = {
-    "Clean draft (passes first round)": set(),
-    "Hallucinated product and stats": {DEFECT_HALLUCINATION},
-    "Generic, no personalization": {DEFECT_GENERIC},
-    "Weak call to action": {DEFECT_WEAK_CTA},
-    "All three flaws at once": {DEFECT_GENERIC, DEFECT_HALLUCINATION, DEFECT_WEAK_CTA},
+    "Clean memo (passes first round)": set(),
+    "Invents commitments not in the notes": {DEFECT_FABRICATION},
+    "Generic, ignores the meeting": {DEFECT_GENERIC},
+    "Missing next steps": {DEFECT_NO_NEXTSTEPS},
+    "All three flaws at once": {DEFECT_GENERIC, DEFECT_FABRICATION, DEFECT_NO_NEXTSTEPS},
 }
 
 
@@ -81,20 +80,22 @@ SCENARIOS = {
 
 @dataclass
 class Brief:
-    """Planner output: the contract the draft is built and judged against."""
-    seller_company: str    # who is selling (your company)
-    product: str           # the offering's name
-    value_prop: str        # one-line description of what the offering does
-    target_company: str    # who is being sold to
-    context_summary: str   # the prospect's stated situation
-    pain_keywords: list
+    """Planner output: the contract the memo is built and judged against."""
+    your_company: str
+    product: str
+    client_company: str
+    client_contact: str
+    meeting_notes: str
+    note_points: list      # the substantive lines pulled from the notes
+    note_keywords: list    # grounding terms (notes minus entity names)
+    note_numbers: list     # figures present in the notes (for grounding)
     must_include: list
     must_avoid: list
 
 
 @dataclass
 class Draft:
-    """Generator output: one pitch attempt."""
+    """Generator output: one memo attempt."""
     round: int
     text: str
     source: str           # "mock" or "live" -- which generator produced it
@@ -117,7 +118,6 @@ class Evaluation:
 
     @property
     def passed(self):
-        # Hard gate: every criterion must clear its threshold.
         return all(r.passed for r in self.results)
 
     @property
@@ -131,11 +131,12 @@ class Evaluation:
 
 @dataclass
 class GroundingResult:
-    """Outcome of checking one factual claim against a source of truth.
+    """Outcome of checking one claim against a source of truth.
 
-    `supported` is True/False once a context graph can answer, or None while no
-    graph is connected (grounding deferred). The evaluator that calls ground()
-    does not change when the backing source goes from stub to real.
+    `supported` is True/False once a source can answer, or None when nothing can
+    be checked. For a memo the meeting notes ARE a source of truth, so figures
+    are checked against them here. The caller does not change when broader
+    context-graph grounding is added.
     """
     claim: str
     supported: bool | None
@@ -147,16 +148,16 @@ class GroundingResult:
 class DecisionTrace:
     """A durable record of one generate-and-evaluate decision.
 
-    This is the artifact that feeds the context graph: not just the verdict, but
-    the entities it touched, the criteria applied, the grounding attempted, and
-    the rationale -- i.e. *why* the output was allowed (or not) to ship. Each
-    trace is meant to append to the event clock as a first-class record.
+    The artifact that feeds the context graph: not just the verdict, but the
+    entities it touched, the criteria applied, the grounding attempted, and the
+    rationale -- i.e. *why* the memo was allowed (or not) to be sent. Each trace
+    is meant to append to the event clock as a first-class record.
     """
     timestamp: str
-    decision: str        # "approve_outreach" | "reject_outreach"
+    decision: str        # "approve_send" | "reject_send"
     verdict: str         # "approved" | "rejected"
     entities: list       # entities this decision touched
-    target_company: str
+    client_company: str
     draft_round: int
     draft_source: str
     score: int
@@ -169,39 +170,65 @@ class DecisionTrace:
 # Planner
 # ---------------------------------------------------------------------------
 
-def _keywords(description):
-    """Substantive words from the description, used to test grounding."""
+def _keywords(text):
+    """Substantive words from a block of text."""
     seen = []
-    for raw in description.split():
-        word = raw.lower().strip(".,:;!?\"'()")
-        if len(word) >= _MIN_KEYWORD_LEN and word not in _STOPWORDS and word not in seen:
+    for raw in text.split():
+        word = raw.lower().strip(".,:;!?\"'()-")
+        if (len(word) >= _MIN_KEYWORD_LEN and word.isalpha()  # drop contractions/numbers
+                and word not in _STOPWORDS and word not in seen):
             seen.append(word)
     return seen
 
 
-def plan_brief(seller_company, product, value_prop, target_company, company_description):
-    """Expand a seller and a target prospect into the brief the draft is judged
-    against."""
-    seller_company = seller_company.strip()
+def _numbers(text):
+    """Figures present in a block of text (used as grounding ground-truth)."""
+    return re.findall(r"\b\d[\d,]*%?\b", text)
+
+
+def _note_points(notes):
+    """The substantive lines of the meeting notes, for display in the brief."""
+    points = []
+    for line in notes.splitlines():
+        line = line.strip().lstrip("-*").strip()
+        if line:
+            points.append(line)
+    return points
+
+
+def plan_brief(your_company, product, client_company, client_contact, meeting_notes):
+    """Turn the meeting into the brief the memo is judged against."""
+    your_company = your_company.strip()
     product = product.strip()
-    target_company = target_company.strip()
-    summary = company_description.strip().split(".")[0].strip()
+    client_company = client_company.strip()
+    client_contact = client_contact.strip()
+
+    # Entity names appear in every memo, so they don't count as "grounding".
+    entity_tokens = set()
+    for name in (your_company, product, client_company, client_contact):
+        for tok in name.lower().split():
+            entity_tokens.add(tok)
+
+    note_keywords = [k for k in _keywords(meeting_notes) if k not in entity_tokens]
+
     return Brief(
-        seller_company=seller_company,
+        your_company=your_company,
         product=product,
-        value_prop=value_prop.strip(),
-        target_company=target_company,
-        context_summary=summary,
-        pain_keywords=_keywords(company_description),
+        client_company=client_company,
+        client_contact=client_contact,
+        meeting_notes=meeting_notes.strip(),
+        note_points=_note_points(meeting_notes),
+        note_keywords=note_keywords,
+        note_numbers=_numbers(meeting_notes),
         must_include=[
-            f"Address {target_company} by name",
-            "Reference their specific, stated situation",
-            f"Pitch {product} as the solution",
-            "End with one concrete call to action",
+            f"Address {client_contact} at {client_company}",
+            "Recap what was actually discussed in the meeting",
+            "Restate the agreed next steps",
+            "Stay professional and concise",
         ],
         must_avoid=[
+            "Commitments, dates, or figures that were not in the meeting",
             f"Any product name other than {product}",
-            "Unverifiable metrics or invented statistics",
             f"More than {MAX_WORDS} words",
         ],
     )
@@ -212,17 +239,15 @@ def plan_brief(seller_company, product, value_prop, target_company, company_desc
 # ---------------------------------------------------------------------------
 
 def generate_draft(brief, history, scenario, use_live=False):
-    """Produce the next pitch draft.
+    """Produce the next memo draft.
 
     `history` is the list of prior (Draft, Evaluation) pairs (empty on round 1);
     it carries the Evaluator's feedback so the Generator can revise. `scenario`
     drives the mock's injected defects and is ignored by the live agent.
 
-    Dispatches to the live agent when `use_live` is set and it is actually
-    available (API key + SDK present); otherwise falls back to the mock so the
-    demo never breaks. If the live call itself fails (bad key, rate limit,
-    network), it also falls back to the mock and records why, rather than
-    crashing the app.
+    Dispatches to the live agent when `use_live` is set and available; otherwise
+    falls back to the mock. If the live call itself fails it also falls back,
+    recording why, rather than crashing the app.
     """
     if use_live and live_generation_available()[0]:
         try:
@@ -246,22 +271,24 @@ def live_generation_available():
 
 
 _LIVE_SYSTEM = (
-    "You are a senior SDR writing concise, personalized B2B cold outreach. "
-    "Ground every line in the specific facts you are given about the prospect; "
-    "do not generalize. Pitch ONLY the named product. Never invent statistics, "
-    "customer counts, or capabilities, and never mention any other product. Keep "
-    f"the email under {MAX_WORDS} words and end with one concrete call to action. "
-    "Output only the email itself, starting with 'Subject:'. No preamble, no notes."
+    "You are an account executive writing a concise, professional post-meeting "
+    "follow-up memo to a client. Ground every statement in the meeting notes you "
+    "are given: do NOT invent commitments, dates, figures, or outcomes that are "
+    "not in the notes, and never mention any product other than the named one. "
+    "Recap what was actually discussed and restate the agreed next steps. Keep it "
+    f"under {MAX_WORDS} words. Output only the memo, starting with 'Subject:'."
 )
 
 
 def _live_prompt(brief, history):
-    """Build the user message: the brief, plus prior feedback on a revision."""
+    """Build the user message: the meeting context, plus prior feedback."""
     lines = [
-        f"Write a cold outreach email from {brief.seller_company} to {brief.target_company}.",
-        f"Product to pitch: {brief.product}.",
-        f"What it does: {brief.value_prop}.",
-        f"What we know about {brief.target_company}: {brief.context_summary}.",
+        f"Write a follow-up memo from {brief.your_company} to {brief.client_contact} "
+        f"at {brief.client_company}.",
+        f"Product discussed: {brief.product}.",
+        "",
+        "Meeting notes (the only source of truth -- do not go beyond them):",
+        brief.meeting_notes,
         "",
         "Must include:",
         *[f"- {m}" for m in brief.must_include],
@@ -272,7 +299,7 @@ def _live_prompt(brief, history):
         last_draft, last_eval = history[-1]
         lines += [
             "",
-            "Your previous draft was REJECTED. Previous draft:",
+            "Your previous memo was REJECTED. Previous draft:",
             last_draft.text,
             "",
             "Fix these specific problems and resubmit:",
@@ -289,9 +316,8 @@ def _live_generate(brief, history):
     client = anthropic.Anthropic()
     message = client.messages.create(
         model=LIVE_MODEL,
-        max_tokens=600,
-        temperature=0.7,  # natural-sounding copy, still grounded by the system prompt
-        # Cache the static system prompt across rounds and prospects.
+        max_tokens=700,
+        temperature=0.6,  # professional, grounded copy
         system=[{"type": "text", "text": _LIVE_SYSTEM,
                  "cache_control": {"type": "ephemeral"}}],
         messages=[{"role": "user", "content": _live_prompt(brief, history)}],
@@ -301,42 +327,47 @@ def _live_generate(brief, history):
 
 
 def _mock_generate(brief, scenario, history):
-    """Deterministic mock: composes a pitch from the brief and injects the
+    """Deterministic mock: composes a memo from the brief and injects the
     scenario's defects, removing any the Evaluator has already flagged."""
     active = set(SCENARIOS.get(scenario, set()))
     for _, evaluation in history:
         active = _apply_feedback(active, evaluation)
-    return _compose_mock_draft(brief, active, len(history) + 1)
+    return _compose_mock_memo(brief, active, len(history) + 1)
 
 
-def _compose_mock_draft(brief, defects, round_number):
+def _compose_mock_memo(brief, defects, round_number):
+    you = brief.your_company
     product = brief.product
-    target = brief.target_company
-    pain_clause = (brief.context_summary[0].lower() + brief.context_summary[1:]
-                   if brief.context_summary
-                   else "a lot of manual, repetitive work is slowing the team down")
+    client = brief.client_company
+    contact = brief.client_contact
 
-    # Clean baseline, composed entirely from the brief.
-    subject = f"{product} for {target}"
-    greeting = f"Hi {target} team,"
-    context = f"Reading about {target}, one thing stood out: {pain_clause}."
-    value = f"{product} {brief.value_prop}."
-    cta = "Open to a quick 10-minute brief next week?"
-    signoff = f"Best,\nThe {brief.seller_company} team"
+    # Clean baseline, grounded in the meeting. (Subject avoids the literal
+    # phrase "next steps" so it can't satisfy the next-steps check on its own.)
+    subject = f"Recap from our meeting: {you} & {client}"
+    greeting = f"Hi {contact},"
+    recap = ("Thanks for the time today. To recap: your dispatchers are losing "
+             f"hours to scattered carrier emails for container status, and {product} "
+             "can pull that tracking data automatically and flag exceptions.")
+    next_steps = ("Next steps:\n- We'll send a short security overview.\n"
+                  "- Let's set up a pilot scoping call next week.")
+    close = f"Best,\nThe {you} team"
 
     # Inject defects.
     if DEFECT_GENERIC in defects:
-        subject = "A smarter way to handle your operations"
-        greeting = "Hi there,"
-        context = "A lot of teams are still stuck doing this by hand and losing time as a result."
-    if DEFECT_HALLUCINATION in defects:
-        value += (f" It's already trusted by over 5,000 companies, and works "
-                  f"alongside our {DEMO_WRONG_PRODUCTS[0]} analytics suite for "
-                  f"end-to-end visibility.")
-    if DEFECT_WEAK_CTA in defects:
-        cta = "Anyway, that's a bit about what we do."
+        # Generic everywhere a meeting reference would normally live, so the memo
+        # fails grounding while still being a structurally complete memo.
+        subject = "Following up on our conversation"
+        recap = ("Thanks for the time today. It was a pleasure to connect and "
+                 "learn more about your business and priorities.")
+        next_steps = ("Next steps:\n- We'll follow up with more details.\n"
+                      "- Let's find time to reconnect soon.")
+    if DEFECT_FABRICATION in defects:
+        recap += (f" Based on today, {product} will cut your dispatch workload by "
+                  "40% within the first month and pay for itself by Q3.")
+    if DEFECT_NO_NEXTSTEPS in defects:
+        next_steps = "Looking forward to staying in touch."
 
-    text = f"Subject: {subject}\n\n{greeting}\n\n{context}\n\n{value}\n\n{cta}\n\n{signoff}"
+    text = f"Subject: {subject}\n\n{greeting}\n\n{recap}\n\n{next_steps}\n\n{close}"
     return Draft(round=round_number, text=text, source="mock", active_defects=sorted(defects))
 
 
@@ -344,80 +375,64 @@ def _compose_mock_draft(brief, defects, round_number):
 # Evaluator
 # ---------------------------------------------------------------------------
 
-_CTA_PATTERNS = [
-    r"open to a", r"up for a", r"would you be open",
-    r"\d+[\s-]?minute", r"quick (call|chat|brief|demo)",
-    r"grab \d+", r"book a", r"schedule a",
-    r"next week\?", r"this week\?",
+_NEXT_STEPS_PATTERNS = [
+    r"next step", r"action item", r"\bwe'll\b", r"\bi'll\b", r"\blet's\b",
+    r"will send", r"will set up", r"follow up", r"follow-up",
 ]
 
 
-def _has_cta(text):
+def _has_next_steps(text):
     low = text.lower()
-    return any(re.search(p, low) for p in _CTA_PATTERNS)
-
-
-def _unverifiable_numbers(text):
-    """Numbers that aren't on the small allowlist of approved figures."""
-    cleaned = re.sub(r"\d+[\s-]?minute(s)?", "", text, flags=re.IGNORECASE)
-    return re.findall(r"\b\d[\d,]*%?\b", cleaned)
+    return any(re.search(p, low) for p in _NEXT_STEPS_PATTERNS)
 
 
 def evaluate_draft(draft, brief):
-    """Score a draft against the brief. Each criterion is a hard threshold."""
+    """Score a memo against the brief. Each criterion is a hard threshold."""
     text = draft.text
     low = text.lower()
     results = []
 
-    # 1. Personalization: names the prospect AND references their context.
-    has_name = brief.target_company.lower() in low
-    matched = [k for k in brief.pain_keywords if k in low]
-    if has_name and matched:
-        fb = f"References {brief.target_company} and their context ('{matched[0]}')."
-    else:
-        missing = []
-        if not has_name:
-            missing.append(f"does not address {brief.target_company} by name")
-        if not matched:
-            missing.append("does not reference their stated situation")
-        fb = ("Draft " + " and ".join(missing) + ". Open by naming the company "
-              "and tying the first line to their actual problem.")
-    results.append(CriterionResult(
-        "personalization", "Personalized to the prospect", has_name and bool(matched), fb))
+    # 1. Addressed to the client.
+    named = (brief.client_company.lower() in low
+             or brief.client_contact.lower() in low)
+    fb = (f"Addresses {brief.client_contact} / {brief.client_company}." if named
+          else f"Does not address {brief.client_contact} at {brief.client_company}.")
+    results.append(CriterionResult("addressed_to_client", "Addressed to the client", named, fb))
 
-    # 2. Factual grounding: no wrong products, no unverifiable numbers.
+    # 2. Grounded in the meeting: references actual discussion points.
+    matched = [k for k in brief.note_keywords if k in low]
+    grounded = bool(matched)
+    fb = (f"References the meeting ('{matched[0]}')." if grounded
+          else "Reads generic -- does not reference anything specific that was "
+               "discussed. Recap the actual points from the notes.")
+    results.append(CriterionResult("grounded_in_meeting", "Grounded in the meeting", grounded, fb))
+
+    # 3. No fabrication: every figure must trace back to the notes; no wrong product.
+    grounding = gather_grounding(draft, brief)
+    fabricated = sorted({f for g in grounding if g.supported is False
+                         for f in re.findall(r"\b\d[\d,]*%?\b", g.claim)
+                         if f not in brief.note_numbers})
     wrong = [p for p in DEMO_WRONG_PRODUCTS if p in text]
-    bad_numbers = _unverifiable_numbers(text)
-    if not wrong and not bad_numbers:
-        fb = "No invented products or unverifiable metrics."
+    clean = not fabricated and not wrong
+    if clean:
+        fb = "No invented figures or products; claims trace to the notes."
     else:
         issues = []
+        if fabricated:
+            issues.append(f"states figure(s) not in the notes: {', '.join(fabricated)}")
         if wrong:
             issues.append(f"mentions unapproved product(s): {', '.join(wrong)}")
-        if bad_numbers:
-            issues.append(f"states unverifiable figure(s): {', '.join(bad_numbers)}")
-        fb = ("Draft " + " and ".join(issues) + f". Remove them -- pitch only "
-              f"{brief.product} and only claims we can back.")
-    results.append(CriterionResult(
-        "factual_grounding", "Factually grounded (no hallucination)",
-        not wrong and not bad_numbers, fb))
+        fb = ("Memo " + " and ".join(issues) + ". Only state what the meeting "
+              "actually covered.")
+    results.append(CriterionResult("no_fabrication", "No fabricated commitments", clean, fb))
 
-    # 3. Correct offering: pitches the seller's product.
-    correct = brief.product in text
-    fb = (f"Pitches {brief.product}." if correct
-          else f"Does not name {brief.product}. State the product we are selling.")
-    results.append(CriterionResult(
-        "correct_offering", f"Pitches the correct product ({brief.product})", correct, fb))
+    # 4. Clear next steps.
+    steps = _has_next_steps(text)
+    fb = ("States the agreed next steps." if steps
+          else "No clear next steps. Restate what was agreed, e.g. the next call.")
+    results.append(CriterionResult("next_steps", "Clear next steps", steps, fb))
 
-    # 4. Call to action: a concrete next step.
-    cta = _has_cta(text)
-    fb = ("Ends with a concrete ask." if cta
-          else "No concrete call to action. Ask for a specific next step, e.g. a "
-               "short call next week.")
-    results.append(CriterionResult(
-        "call_to_action", "Has a clear call to action", cta, fb))
-
-    # 5. Format and length: subject line present, within the word budget.
+    # 5. Format and length.
     has_subject = "subject:" in low
     words = len(text.split())
     ok = has_subject and words <= MAX_WORDS
@@ -429,36 +444,39 @@ def evaluate_draft(draft, brief):
             parts.append("missing a subject line")
         if words > MAX_WORDS:
             parts.append(f"too long at {words} words (limit {MAX_WORDS})")
-        fb = "Draft is " + " and ".join(parts) + "."
-    results.append(CriterionResult(
-        "format", "Complete and concise", ok, fb))
+        fb = "Memo is " + " and ".join(parts) + "."
+    results.append(CriterionResult("format", "Complete and concise", ok, fb))
 
     return Evaluation(results=results)
 
 
 # ---------------------------------------------------------------------------
-# Grounding seam: check claims against a source of truth (the context graph)
+# Grounding seam: check claims against a source of truth
 # ---------------------------------------------------------------------------
 
 def ground(claim, brief):
-    """Check whether a factual claim is supported by a source of truth.
+    """Check whether a claim is supported by a source of truth.
 
-    SEAM. Today there is no context graph wired, so this returns "unknown"
-    (supported=None) and defers. When the context graph lands, back this with a
-    query against the state/event clocks and the relationship graph; everything
-    that calls ground() stays the same. This is the grounding counterpart to the
-    generate_draft() live-agent seam.
+    For a memo the meeting notes are an available source of truth, so figures in
+    the claim are checked against the figures in the notes. Claims without a
+    checkable figure return "unknown" (None) -- verifying those needs the wider
+    context graph, which is still deferred. This is the grounding counterpart to
+    the generate_draft() live-agent seam: when the context graph lands, extend
+    this function and nothing that calls it changes.
     """
-    return GroundingResult(
-        claim=claim,
-        supported=None,
-        source="",
-        note="no context graph connected; grounding deferred",
-    )
+    figures = re.findall(r"\b\d[\d,]*%?\b", claim)
+    if not figures:
+        return GroundingResult(claim, None, "",
+                               "no checkable figure; deferred to context graph")
+    unsupported = [f for f in figures if f not in brief.note_numbers]
+    if unsupported:
+        return GroundingResult(claim, False, "meeting_notes",
+                               f"figure(s) not in the notes: {', '.join(unsupported)}")
+    return GroundingResult(claim, True, "meeting_notes", "figures match the meeting notes")
 
 
 def extract_claims(draft, brief):
-    """Pull candidate factual claims (sentences naming an entity or a figure)."""
+    """Pull candidate claims (sentences naming an entity or stating a figure)."""
     text = draft.text.replace("\n", " ")
     claims = []
     for sentence in re.split(r"(?<=[.?!])\s+", text):
@@ -466,7 +484,7 @@ def extract_claims(draft, brief):
         if not sentence:
             continue
         names_entity = (brief.product in sentence
-                        or brief.target_company.lower() in sentence.lower())
+                        or brief.client_company.lower() in sentence.lower())
         has_figure = bool(re.search(r"\d", sentence))
         if names_entity or has_figure:
             claims.append(sentence)
@@ -479,16 +497,16 @@ def gather_grounding(draft, brief):
 
 
 def build_decision_trace(brief, draft, evaluation, timestamp=None):
-    """Assemble the durable decision trace for one evaluated draft."""
+    """Assemble the durable decision trace for one evaluated memo."""
     ts = timestamp or datetime.now(timezone.utc).isoformat()
     rationale = ("All criteria passed." if evaluation.passed
                  else "Rejected on: " + "; ".join(r.label for r in evaluation.failed))
     return DecisionTrace(
         timestamp=ts,
-        decision="approve_outreach" if evaluation.passed else "reject_outreach",
+        decision="approve_send" if evaluation.passed else "reject_send",
         verdict="approved" if evaluation.passed else "rejected",
-        entities=[brief.seller_company, brief.product, brief.target_company],
-        target_company=brief.target_company,
+        entities=[brief.your_company, brief.product, brief.client_company],
+        client_company=brief.client_company,
         draft_round=draft.round,
         draft_source=draft.source,
         score=evaluation.score,
@@ -513,17 +531,15 @@ def _apply_feedback(active_defects, evaluation):
     return remaining
 
 
-def run_pipeline(seller_company, product, value_prop, target_company,
-                 company_description, scenario, max_rounds=3, use_live=False):
+def run_pipeline(your_company, product, client_company, client_contact,
+                 meeting_notes, scenario, max_rounds=3, use_live=False):
     """Run the full loop. Returns (brief, rounds) where rounds is a list of
     (Draft, Evaluation) pairs, one per generate-and-evaluate cycle."""
-    brief = plan_brief(seller_company, product, value_prop,
-                       target_company, company_description)
+    brief = plan_brief(your_company, product, client_company, client_contact, meeting_notes)
     history = []
     for _ in range(max_rounds):
         draft = generate_draft(brief, history, scenario, use_live=use_live)
         evaluation = evaluate_draft(draft, brief)
-        # Stop if the Generator can't make progress (same draft twice).
         stalled = bool(history) and draft.text == history[-1][0].text
         history.append((draft, evaluation))
         if evaluation.passed or stalled:

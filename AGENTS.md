@@ -1,9 +1,11 @@
-# GTM Outreach Prototype
+# Client Memo Prototype
 
 A flat, linear prototype of the **Planner -> Generator -> Evaluator** three-agent
-architecture, applied to GTM outreach. A target prospect goes in; a pitch comes
-out only after it clears an independent evaluator checkpoint that flags
-hallucinations and missing context before anything could reach a customer.
+architecture, applied to the post-meeting **client memo**. Your company, the
+client, and the meeting notes go in; the follow-up memo comes out only after it
+clears an independent evaluator checkpoint that ensures it stays grounded in what
+was actually discussed (no invented commitments) before it can be sent to the
+client.
 
 ## Project overview
 
@@ -29,34 +31,42 @@ A change is "done" when the tests pass — not when the code merely runs.
 
 ## The architecture
 
-- **Planner** turns the prospect into a *brief* (the contract): what the pitch
-  must include, what it must avoid, and the criteria it will be judged against.
-- **Generator** writes a draft against the brief. It is mocked and injects a
-  known flaw per demo scenario so the evaluator has something real to catch.
-- **Evaluator** scores the draft against five criteria, each a hard threshold:
-  personalization, factual grounding (no hallucination), correct product,
-  call to action, and format/length. Any failure rejects the draft with
-  specific, actionable feedback.
-- **Loop**: a rejected draft's feedback goes back to the generator, which
-  revises and resubmits, until it passes or the round limit is hit.
+- **Planner** turns the meeting (your company, the client, the notes) into a
+  *brief* (the contract): what the memo must include, what it must avoid, the
+  grounding terms and figures from the notes, and the criteria it is judged by.
+- **Generator** writes a memo against the brief. Mock (default) or a real Claude
+  call behind a flag; the mock injects a known flaw per demo scenario so the
+  evaluator has something real to catch.
+- **Evaluator** scores the memo against five criteria, each a hard threshold:
+  addressed-to-client, grounded-in-the-meeting, no-fabrication (no figure or
+  commitment absent from the notes), clear-next-steps, and format/length. Any
+  failure rejects the memo with specific, actionable feedback.
+- **Loop**: a rejected memo's feedback goes back to the generator, which revises
+  and resubmits, until it passes or the round limit is hit.
+- **Decision trace**: every evaluation emits a `DecisionTrace` (entities,
+  criteria, grounding, rationale) meant to append to the context graph.
 
 The generator and evaluator are deliberately separate: the agent that writes the
-pitch does not approve its own work.
+memo does not approve its own work.
 
 ## Hard constraints
 
-- Pitch only `Sandman`. Any other product name is a hallucination and must fail.
-- No unverifiable metrics or invented statistics.
-- The evaluator — never the generator — decides whether a draft is done.
+- Mention only the named product. Any other product name is a hallucination and must fail.
+- No commitments, dates, or figures that were not in the meeting notes.
+- The evaluator — never the generator — decides whether a memo can be sent.
 
-## The two swap seams (for integrating real components)
+## The swap seams (for integrating real components)
 
-1. **Live agent**: replace the body of `generate_draft(brief, ...)` in
-   `gtm_pipeline.py` with a real model call. Keep the signature; the Planner and
+1. **Live agent**: `generate_draft(brief, history, scenario, use_live)` dispatches
+   to a real Claude call when a key is present, else the mock. Planner and
    Evaluator are untouched.
 2. **Evaluator state**: `evaluate_draft()` returns an `Evaluation` of
-   `CriterionResult(id, label, passed, feedback)` objects. That shape is the
-   contract to line up against another implementation's state tracking.
+   `CriterionResult(id, label, passed, feedback)` objects — the contract to line
+   up against another implementation's state tracking.
+3. **Grounding**: `ground(claim, brief)` checks claims against a source of truth
+   (the meeting notes now, the context graph later) without changing callers.
+4. **Decision trace**: `build_decision_trace(...)` is the durable record that
+   feeds the context graph's event clock.
 
 ## How this maps to the harness PDFs
 

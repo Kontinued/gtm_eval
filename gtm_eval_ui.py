@@ -7,35 +7,31 @@ import gtm_pipeline as pipeline
 # This file is the thin presentation layer. All logic lives in gtm_pipeline.py
 # (Planner / Generator / Evaluator), which is unit tested separately.
 
-st.title("GTM Outreach: Planner, Generator, Evaluator")
+DEFAULT_NOTES = """- Dana walked us through how dispatchers spend ~3 hours a day checking email for container status.
+- They manage around 3,000 active shipments at any time.
+- Main frustration: no single place to see status; updates are scattered across carrier emails.
+- Dana liked that Sandman pulls tracking data automatically and flags exceptions.
+- Open question: how Sandman handles their 4 EDI carrier integrations.
+- Agreed: we'll send a short security overview and set up a pilot scoping call next week."""
+
+st.title("Client Memo: Planner, Generator, Evaluator")
 st.write(
-    "Describe your company and a prospect. A planner turns it into a brief, a "
-    "generator writes a pitch against that brief, and an evaluator scores the "
-    "pitch against hard rules before it can ship. If the pitch fails, the "
-    "evaluator's feedback goes back to the generator, which revises and "
-    "resubmits until it passes."
+    "After a booked meeting, draft the follow-up memo to the client. A planner "
+    "turns the meeting into a brief, a generator writes the memo, and an "
+    "evaluator scores it against hard rules -- above all, that it stays grounded "
+    "in what was actually discussed -- before it can be sent. A failed memo loops "
+    "back with feedback and is rewritten until it passes."
 )
 
 st.subheader("1. Your company")
-seller_company = st.text_input("Your company name", value="Oaisis")
-product = st.text_input("Product or offering name", value="Sandman")
-value_prop = st.text_area(
-    "What it does (one or two lines)",
-    value=(
-        "connects to Slack, email, and GitHub, retrieves information, and "
-        "delegates tasks across your team"
-    ),
-)
+your_company = st.text_input("Your company name", value="Oaisis")
+product = st.text_input("Product discussed", value="Sandman")
 
-st.subheader("2. Target prospect")
-target_company = st.text_input("Company name", value="Nexus Logistics")
-company_description = st.text_area(
-    "Company description",
-    value=(
-        "They manage thousands of supply chain shipments, but their dispatchers "
-        "waste hours manually checking emails for container status updates."
-    ),
-)
+st.subheader("2. The meeting")
+client_company = st.text_input("Client company", value="Nexus Logistics")
+client_contact = st.text_input("Client contact (who you met)", value="Dana")
+meeting_notes = st.text_area("Meeting notes", value=DEFAULT_NOTES, height=200)
+
 live_ok, live_reason = pipeline.live_generation_available()
 use_live = st.toggle("Use live agent (real Claude call)", value=live_ok)
 if use_live and not live_ok:
@@ -50,23 +46,24 @@ scenario = st.selectbox(
 st.caption(
     "Mock mode: each scenario injects a known flaw so you can watch the evaluator "
     "catch it and the loop correct it. Live mode: a real Claude call writes the "
-    "pitch and the evaluator judges its actual, unpredictable output. Either way "
-    "the evaluator and the loop are unchanged."
+    "memo and the evaluator judges its actual output. Either way the evaluator "
+    "and the loop are unchanged."
 )
 
 if st.button("Run pipeline"):
     st.divider()
 
     brief, rounds = pipeline.run_pipeline(
-        seller_company, product, value_prop,
-        target_company, company_description, scenario, max_rounds=3,
-        use_live=use_live,
+        your_company, product, client_company, client_contact,
+        meeting_notes, scenario, max_rounds=3, use_live=use_live,
     )
 
     # Planner output: the brief / contract.
     st.subheader("3. Planner brief")
-    st.write(f"**Seller:** {brief.seller_company} — pitching {brief.product}")
-    st.write(f"**Context:** {brief.context_summary}")
+    st.write(f"**Memo:** {brief.your_company} -> {brief.client_contact} at {brief.client_company}")
+    st.write("**From the meeting**")
+    for point in brief.note_points:
+        st.write(f"- {point}")
     col_in, col_out = st.columns(2)
     with col_in:
         st.write("**Must include**")
@@ -109,12 +106,12 @@ if st.button("Run pipeline"):
 
     # Decision trace: the durable record this checkpoint emits. This is the
     # artifact that feeds the context graph -- not just the verdict, but the
-    # entities, criteria, grounding, and rationale (why it was allowed to ship).
+    # entities, criteria, grounding, and rationale (why it was allowed to send).
     st.subheader("6. Decision trace")
     st.caption(
         "The record this checkpoint emits, meant to append to the context "
-        "graph's event clock. Grounding is deferred until a context graph is "
-        "connected (see the ground() seam)."
+        "graph's event clock. Figures are grounded against the meeting notes; "
+        "broader grounding is deferred until a context graph is connected."
     )
     trace = pipeline.build_decision_trace(brief, final_draft, final_eval)
     st.json(asdict(trace))
