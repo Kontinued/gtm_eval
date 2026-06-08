@@ -28,7 +28,8 @@ State objects (Brief, Draft, Evaluation) are explicit dataclasses so the
 pipeline state is easy to inspect and to line up against another implementation.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
 import os
 import re
 
@@ -126,6 +127,42 @@ class Evaluation:
     @property
     def failed(self):
         return [r for r in self.results if not r.passed]
+
+
+@dataclass
+class GroundingResult:
+    """Outcome of checking one factual claim against a source of truth.
+
+    `supported` is True/False once a context graph can answer, or None while no
+    graph is connected (grounding deferred). The evaluator that calls ground()
+    does not change when the backing source goes from stub to real.
+    """
+    claim: str
+    supported: bool | None
+    source: str
+    note: str
+
+
+@dataclass
+class DecisionTrace:
+    """A durable record of one generate-and-evaluate decision.
+
+    This is the artifact that feeds the context graph: not just the verdict, but
+    the entities it touched, the criteria applied, the grounding attempted, and
+    the rationale -- i.e. *why* the output was allowed (or not) to ship. Each
+    trace is meant to append to the event clock as a first-class record.
+    """
+    timestamp: str
+    decision: str        # "approve_outreach" | "reject_outreach"
+    verdict: str         # "approved" | "rejected"
+    entities: list       # entities this decision touched
+    target_company: str
+    draft_round: int
+    draft_source: str
+    score: int
+    criteria: list       # [{id, passed, feedback}]
+    grounding: list      # [{claim, supported, source, note}]
+    rationale: str
 
 
 # ---------------------------------------------------------------------------
@@ -397,6 +434,69 @@ def evaluate_draft(draft, brief):
         "format", "Complete and concise", ok, fb))
 
     return Evaluation(results=results)
+
+
+# ---------------------------------------------------------------------------
+# Grounding seam: check claims against a source of truth (the context graph)
+# ---------------------------------------------------------------------------
+
+def ground(claim, brief):
+    """Check whether a factual claim is supported by a source of truth.
+
+    SEAM. Today there is no context graph wired, so this returns "unknown"
+    (supported=None) and defers. When the context graph lands, back this with a
+    query against the state/event clocks and the relationship graph; everything
+    that calls ground() stays the same. This is the grounding counterpart to the
+    generate_draft() live-agent seam.
+    """
+    return GroundingResult(
+        claim=claim,
+        supported=None,
+        source="",
+        note="no context graph connected; grounding deferred",
+    )
+
+
+def extract_claims(draft, brief):
+    """Pull candidate factual claims (sentences naming an entity or a figure)."""
+    text = draft.text.replace("\n", " ")
+    claims = []
+    for sentence in re.split(r"(?<=[.?!])\s+", text):
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        names_entity = (brief.product in sentence
+                        or brief.target_company.lower() in sentence.lower())
+        has_figure = bool(re.search(r"\d", sentence))
+        if names_entity or has_figure:
+            claims.append(sentence)
+    return claims
+
+
+def gather_grounding(draft, brief):
+    """Ground every extracted claim. Returns a list of GroundingResult."""
+    return [ground(claim, brief) for claim in extract_claims(draft, brief)]
+
+
+def build_decision_trace(brief, draft, evaluation, timestamp=None):
+    """Assemble the durable decision trace for one evaluated draft."""
+    ts = timestamp or datetime.now(timezone.utc).isoformat()
+    rationale = ("All criteria passed." if evaluation.passed
+                 else "Rejected on: " + "; ".join(r.label for r in evaluation.failed))
+    return DecisionTrace(
+        timestamp=ts,
+        decision="approve_outreach" if evaluation.passed else "reject_outreach",
+        verdict="approved" if evaluation.passed else "rejected",
+        entities=[brief.seller_company, brief.product, brief.target_company],
+        target_company=brief.target_company,
+        draft_round=draft.round,
+        draft_source=draft.source,
+        score=evaluation.score,
+        criteria=[{"id": r.id, "passed": r.passed, "feedback": r.feedback}
+                  for r in evaluation.results],
+        grounding=[asdict(g) for g in gather_grounding(draft, brief)],
+        rationale=rationale,
+    )
 
 
 # ---------------------------------------------------------------------------

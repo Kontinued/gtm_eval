@@ -1,3 +1,5 @@
+from dataclasses import asdict
+
 import streamlit as st
 
 import gtm_pipeline as pipeline
@@ -104,3 +106,15 @@ if st.button("Run pipeline"):
             f"Still failing after {len(rounds)} round(s). Held back from sending — "
             "this is the guardrail doing its job."
         )
+
+    # Decision trace: the durable record this checkpoint emits. This is the
+    # artifact that feeds the context graph -- not just the verdict, but the
+    # entities, criteria, grounding, and rationale (why it was allowed to ship).
+    st.subheader("6. Decision trace")
+    st.caption(
+        "The record this checkpoint emits, meant to append to the context "
+        "graph's event clock. Grounding is deferred until a context graph is "
+        "connected (see the ground() seam)."
+    )
+    trace = pipeline.build_decision_trace(brief, final_draft, final_eval)
+    st.json(asdict(trace))

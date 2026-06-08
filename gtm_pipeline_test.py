@@ -154,6 +154,41 @@ def test_live_call_failure_falls_back_to_mock():
     assert "Sandman" in draft.text  # still a valid draft
 
 
+def test_ground_is_a_deferred_stub():
+    brief = _brief()
+    result = p.ground("Sandman connects to Slack and email", brief)
+    assert result.supported is None
+    assert "deferred" in result.note
+
+
+def test_extract_claims_finds_entity_and_figure_sentences():
+    brief, draft, _ = _eval_for("Clean draft (passes first round)")
+    claims = p.extract_claims(draft, brief)
+    assert claims  # non-empty
+    assert any("Sandman" in c for c in claims)
+
+
+def test_decision_trace_records_approval():
+    brief, draft, ev = _eval_for("Clean draft (passes first round)")
+    trace = p.build_decision_trace(brief, draft, ev, timestamp="2026-06-05T00:00:00Z")
+    assert trace.verdict == "approved"
+    assert trace.decision == "approve_outreach"
+    assert "Sandman" in trace.entities
+    assert trace.target_company == "Nexus Logistics"
+    assert len(trace.criteria) == 5
+    assert isinstance(trace.grounding, list)
+    assert trace.timestamp == "2026-06-05T00:00:00Z"
+
+
+def test_decision_trace_records_rejection_with_rationale():
+    brief, draft, ev = _eval_for("Hallucinated product and stats")
+    trace = p.build_decision_trace(brief, draft, ev)
+    assert trace.verdict == "rejected"
+    assert trace.decision == "reject_outreach"
+    assert "Factually grounded" in trace.rationale  # names the failed criterion
+    assert trace.timestamp  # auto-stamped when not provided
+
+
 def test_loop_converges_when_all_flaws_present():
     _, rounds = _run("All three flaws at once")
     assert rounds[0][1].passed is False
