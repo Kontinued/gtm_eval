@@ -71,14 +71,14 @@ memo does not get to approve its own work.
 
 - Writes a memo `Draft` against the `Brief`. One interface, two implementations:
   - **Mock (default):** composes the memo deterministically from the brief and can inject known defects per scenario, so the evaluator has something real to catch and the loop something to fix. Reliable for demos and tests.
-  - **Live (behind a flag):** a real Claude call writes the memo and, on a revision, receives the previous draft plus the evaluator's feedback. Enable the **Use live agent** toggle after:
+  - **Live (behind a flag):** a real Gemini call writes the memo and, on a revision, receives the previous draft plus the evaluator's feedback. Enable the **Use live agent** toggle after:
 
     ```bash
-    pip install anthropic
-    setx ANTHROPIC_API_KEY "sk-ant-..."   # then reopen the terminal
+    pip install google-genai
+    setx GEMINI_API_KEY "..."   # then reopen the terminal
     ```
 
-    Model defaults to `claude-sonnet-4-6` (override with `GTM_MODEL`). If the key or SDK is missing, it falls back to the mock automatically.
+    Model defaults to `gemini-2.5-flash` (override with `GEMINI_MODEL`). If the key or SDK is missing, it falls back to the mock automatically. Claude via AWS Bedrock is the eventual target; the swap lives entirely behind `_live_generate()`.
 
 ### 3. Evaluator (`gtm_pipeline.py`)
 

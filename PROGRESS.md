@@ -33,12 +33,14 @@
 
 ## To enable live mode
 
-    pip install anthropic
-    setx ANTHROPIC_API_KEY "sk-ant-..."   # then reopen the terminal
+    pip install google-genai
+    setx GEMINI_API_KEY "..."   # then reopen the terminal
 
 Then flip the "Use live agent" toggle (it defaults on once available). No code
-change needed. NOTE: the first real live run is still unverified (no key was
-available when this was built).
+change needed. The live generator currently uses Gemini (`gemini-2.5-flash`,
+override with `GEMINI_MODEL`) as a pragmatic unblock on available GCP access;
+Claude via AWS Bedrock is the eventual target, swappable behind `_live_generate()`.
+NOTE: the first real live run is still unverified.
 
 ## Demo scenarios (in the UI dropdown)
 

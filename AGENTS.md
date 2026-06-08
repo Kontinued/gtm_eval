@@ -34,8 +34,9 @@ A change is "done" when the tests pass — not when the code merely runs.
 - **Planner** turns the meeting (your company, the client, the notes) into a
   *brief* (the contract): what the memo must include, what it must avoid, the
   grounding terms and figures from the notes, and the criteria it is judged by.
-- **Generator** writes a memo against the brief. Mock (default) or a real Claude
-  call behind a flag; the mock injects a known flaw per demo scenario so the
+- **Generator** writes a memo against the brief. Mock (default) or a real Gemini
+  call behind a flag (Claude/Bedrock is the eventual target, swappable behind
+  `_live_generate()`); the mock injects a known flaw per demo scenario so the
   evaluator has something real to catch.
 - **Evaluator** scores the memo against five criteria, each a hard threshold:
   addressed-to-client, grounded-in-the-meeting, no-fabrication (no figure or

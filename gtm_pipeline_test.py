@@ -153,6 +153,17 @@ def test_loop_converges_for_each_single_flaw():
         assert len(rounds) == 2, scenario  # one revision is enough
 
 
+def test_cost_ceiling_stops_the_loop():
+    # A flawed scenario would normally take 2 rounds, but a tiny token budget
+    # (the cost ceiling) stops it after round 1. Mock drafts report an estimated
+    # token count so this is exercisable without a live call.
+    _, rounds = p.run_pipeline(YOUR, PRODUCT, CLIENT, CONTACT, NOTES,
+                               "Invents commitments not in the notes",
+                               max_rounds=3, token_budget=10)
+    assert len(rounds) == 1
+    assert rounds[-1][1].passed is False
+
+
 def test_loop_converges_when_all_flaws_present():
     _, rounds = _run("All three flaws at once")
     assert rounds[0][1].passed is False

@@ -33,11 +33,13 @@ client_contact = st.text_input("Client contact (who you met)", value="Dana")
 meeting_notes = st.text_area("Meeting notes", value=DEFAULT_NOTES, height=200)
 
 live_ok, live_reason = pipeline.live_generation_available()
-use_live = st.toggle("Use live agent (real Claude call)", value=live_ok)
+use_live = st.toggle("Use live agent (real Gemini call)", value=live_ok)
 if use_live and not live_ok:
     st.info(f"Live agent unavailable ({live_reason}). Falling back to the mock.")
 elif live_ok:
-    st.caption(f"Live agent ready ({pipeline.LIVE_MODEL}).")
+    st.caption(f"Live agent ready ({pipeline.GEMINI_MODEL}).")
+
+ceiling = st.number_input("Cost ceiling (max tokens, 0 = none)", min_value=0, value=0, step=500)
 
 scenario = st.selectbox(
     "Generator scenario (mock only)", list(pipeline.SCENARIOS.keys()),
@@ -45,7 +47,7 @@ scenario = st.selectbox(
 )
 st.caption(
     "Mock mode: each scenario injects a known flaw so you can watch the evaluator "
-    "catch it and the loop correct it. Live mode: a real Claude call writes the "
+    "catch it and the loop correct it. Live mode: a real Gemini call writes the "
     "memo and the evaluator judges its actual output. Either way the evaluator "
     "and the loop are unchanged."
 )
@@ -56,6 +58,7 @@ if st.button("Run pipeline"):
     brief, rounds = pipeline.run_pipeline(
         your_company, product, client_company, client_contact,
         meeting_notes, scenario, max_rounds=3, use_live=use_live,
+        token_budget=(ceiling or None),
     )
 
     # Planner output: the brief / contract.

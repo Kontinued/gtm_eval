@@ -38,14 +38,16 @@ import re
 # A client memo can run a little longer than a cold email, but not by much.
 MAX_WORDS = 180
 
-# Default model for the live generator. Override with the GTM_MODEL env var.
-LIVE_MODEL = os.environ.get("GTM_MODEL", "claude-sonnet-4-6")
+# Live-generator model (Gemini). Override via GEMINI_MODEL / GTM_MODEL env vars.
+# Claude/Bedrock is the eventual target; the live seam swaps without touching the
+# Planner, Evaluator, or loop.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", os.environ.get("GTM_MODEL", "gemini-2.5-flash"))
 
-# Demo-only, deliberately FICTIONAL stand-ins for "a product that isn't yours".
-# The Evaluator flags any of these as a hallucinated/confused product. Kept
-# obviously fake so they never collide with real internal names (e.g. the
-# 'prairie' repo) and aren't common words that could false-positive ('sandbox').
-DEMO_WRONG_PRODUCTS = ["Sandcastle", "Driftwave", "Lumenza"]
+# Deliberately fictional stand-ins for "a product that isn't yours", so the
+# Evaluator has a wrong-product to flag (mainly relevant to the live agent, which
+# could name a competitor). Kept obviously fake to avoid colliding with real
+# internal names/codenames (e.g. the "prairie" repo).
+DEMO_WRONG_PRODUCTS = ["Globex Analytics", "Initech Suite", "Acme Cloud"]
 
 # Words shorter than this are too generic to count as "referencing the meeting".
 _MIN_KEYWORD_LEN = 5
@@ -100,8 +102,9 @@ class Draft:
     """Generator output: one memo attempt."""
     round: int
     text: str
-    source: str           # "mock" or "live" -- which generator produced it
+    source: str           # "mock" or "live (gemini)" -- which generator produced it
     active_defects: list  # mock only; [] for live. Demo transparency.
+    tokens: int = 0       # tokens spent producing it (for the cost ceiling)
 
 
 @dataclass
@@ -263,12 +266,12 @@ def generate_draft(brief, history, scenario, use_live=False):
 
 def live_generation_available():
     """(ok, reason) -- whether the live agent can run right now."""
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        return False, "ANTHROPIC_API_KEY is not set"
+    if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
+        return False, "GEMINI_API_KEY is not set"
     try:
-        import anthropic  # noqa: F401
+        from google import genai  # noqa: F401
     except ImportError:
-        return False, "the 'anthropic' package is not installed (pip install anthropic)"
+        return False, "the 'google-genai' package is not installed (pip install google-genai)"
     return True, ""
 
 
@@ -311,21 +314,28 @@ def _live_prompt(brief, history):
 
 
 def _live_generate(brief, history):
-    """Live agent: a real Claude call. This is the swap that makes the
-    Evaluator face real, unpredictable output."""
-    import anthropic
+    """Live agent: a real Gemini call. This is the swap that makes the Evaluator
+    face real, unpredictable output. (Swap to Claude/Bedrock later behind this
+    same function -- the Planner, Evaluator, and loop do not change.)"""
+    from google import genai
+    from google.genai import types
 
-    client = anthropic.Anthropic()
-    message = client.messages.create(
-        model=LIVE_MODEL,
-        max_tokens=700,
-        temperature=0.6,  # professional, grounded copy
-        system=[{"type": "text", "text": _LIVE_SYSTEM,
-                 "cache_control": {"type": "ephemeral"}}],
-        messages=[{"role": "user", "content": _live_prompt(brief, history)}],
+    client = genai.Client(
+        api_key=os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=_live_prompt(brief, history),
+        config=types.GenerateContentConfig(
+            system_instruction=_LIVE_SYSTEM,
+            temperature=0.6,           # professional, grounded copy
+            max_output_tokens=2048,
+        ),
     )
-    text = "".join(block.text for block in message.content if block.type == "text").strip()
-    return Draft(round=len(history) + 1, text=text, source="live", active_defects=[])
+    text = (response.text or "").strip()
+    usage = getattr(response, "usage_metadata", None)
+    tokens = getattr(usage, "total_token_count", 0) or 0
+    return Draft(round=len(history) + 1, text=text, source="live (gemini)",
+                 active_defects=[], tokens=tokens)
 
 
 def _mock_generate(brief, scenario, history):
@@ -370,7 +380,13 @@ def _compose_mock_memo(brief, defects, round_number):
         next_steps = "Looking forward to staying in touch."
 
     text = f"Subject: {subject}\n\n{greeting}\n\n{recap}\n\n{next_steps}\n\n{close}"
-    return Draft(round=round_number, text=text, source="mock", active_defects=sorted(defects))
+    return Draft(round=round_number, text=text, source="mock",
+                 active_defects=sorted(defects), tokens=_estimate_tokens(text))
+
+
+def _estimate_tokens(text):
+    """Rough token estimate so the cost ceiling is meaningful even in mock mode."""
+    return round(len(text.split()) * 1.3)
 
 
 # ---------------------------------------------------------------------------
@@ -534,16 +550,24 @@ def _apply_feedback(active_defects, evaluation):
 
 
 def run_pipeline(your_company, product, client_company, client_contact,
-                 meeting_notes, scenario, max_rounds=3, use_live=False):
+                 meeting_notes, scenario, max_rounds=3, use_live=False, token_budget=None):
     """Run the full loop. Returns (brief, rounds) where rounds is a list of
-    (Draft, Evaluation) pairs, one per generate-and-evaluate cycle."""
+    (Draft, Evaluation) pairs, one per generate-and-evaluate cycle.
+
+    Two stop conditions (the GTM005 verifier-loop requirement): `max_rounds`
+    caps the number of attempts, and `token_budget` is a cost ceiling -- once the
+    cumulative tokens spent reach it, the loop stops even if not yet passing."""
     brief = plan_brief(your_company, product, client_company, client_contact, meeting_notes)
     history = []
+    tokens_used = 0
     for _ in range(max_rounds):
         draft = generate_draft(brief, history, scenario, use_live=use_live)
+        tokens_used += draft.tokens
         evaluation = evaluate_draft(draft, brief)
         stalled = bool(history) and draft.text == history[-1][0].text
         history.append((draft, evaluation))
         if evaluation.passed or stalled:
             break
+        if token_budget is not None and tokens_used >= token_budget:
+            break  # cost ceiling reached
     return brief, history
