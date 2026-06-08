@@ -64,7 +64,7 @@ converges; the decision trace records approve/reject with grounding.
   don't change.
 - `build_decision_trace(...) -> DecisionTrace` — the durable record meant to
   append to the event clock (and could write to `quality.md` / `diagnostics.md`).
-- `generate_draft(brief, history, scenario, use_live)` — mock or live Claude
+- `generate_draft(brief, history, scenario, use_live)` — mock or live Gemini
   behind one seam.
 
 ## Open questions for the team

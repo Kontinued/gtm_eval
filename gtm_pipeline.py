@@ -35,6 +35,14 @@ from datetime import datetime, timezone
 import os
 import re
 
+# Load a local .env (e.g. GEMINI_API_KEY) if python-dotenv is present. Optional
+# and harmless when absent, so the logic layer keeps no hard dependency on it.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 # A client memo can run a little longer than a cold email, but not by much.
 MAX_WORDS = 180
 
