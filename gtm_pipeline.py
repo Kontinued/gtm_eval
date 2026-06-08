@@ -41,9 +41,11 @@ MAX_WORDS = 180
 # Default model for the live generator. Override with the GTM_MODEL env var.
 LIVE_MODEL = os.environ.get("GTM_MODEL", "claude-sonnet-4-6")
 
-# Demo-only stand-ins for "a product that isn't yours". The mock injects one as
-# a hallucination; the Evaluator flags the same set.
-DEMO_WRONG_PRODUCTS = ["Prairie", "Sandstorm", "Sandbox"]
+# Demo-only, deliberately FICTIONAL stand-ins for "a product that isn't yours".
+# The Evaluator flags any of these as a hallucinated/confused product. Kept
+# obviously fake so they never collide with real internal names (e.g. the
+# 'prairie' repo) and aren't common words that could false-positive ('sandbox').
+DEMO_WRONG_PRODUCTS = ["Sandcastle", "Driftwave", "Lumenza"]
 
 # Words shorter than this are too generic to count as "referencing the meeting".
 _MIN_KEYWORD_LEN = 5
