@@ -143,6 +143,55 @@ def test_decision_trace_records_rejection_and_fabrication_grounding():
     assert any(g["supported"] is False for g in trace.grounding)
 
 
+def test_no_faithfulness_criterion_without_a_verdict():
+    _, draft, ev = _eval_for("Clean memo (passes first round)")
+    assert all(r.id != "faithfulness" for r in ev.results)
+    assert len(ev.results) == 5
+
+
+def test_faithfulness_judge_flags_unsupported():
+    brief, draft, _ = _eval_for("Clean memo (passes first round)")
+    verdict = p.FaithfulnessVerdict(
+        supported=False,
+        unsupported_claims=[{"claim": "40% cost cut", "why": "not in notes"}],
+        tokens=0, note="test")
+    ev = p.evaluate_draft(draft, brief, faithfulness=verdict)
+    assert len(ev.results) == 6
+    assert not ev.passed
+    f = next(r for r in ev.results if r.id == "faithfulness")
+    assert not f.passed and "40% cost cut" in f.feedback
+
+
+def test_faithfulness_judge_passes_when_supported():
+    brief, draft, _ = _eval_for("Clean memo (passes first round)")
+    verdict = p.FaithfulnessVerdict(True, [], 5, "test")
+    ev = p.evaluate_draft(draft, brief, faithfulness=verdict)
+    assert ev.passed
+    assert next(r for r in ev.results if r.id == "faithfulness").passed
+
+
+def test_deferred_verdict_is_non_blocking():
+    brief, draft, _ = _eval_for("Clean memo (passes first round)")
+    verdict = p.FaithfulnessVerdict(None, [], 0, "live model unavailable; deferred")
+    ev = p.evaluate_draft(draft, brief, faithfulness=verdict)
+    assert ev.passed  # deferred does not fail the gate
+    assert next(r for r in ev.results if r.id == "faithfulness").passed
+
+
+def test_run_pipeline_runs_judge_when_enabled():
+    # Stub the judge + availability so wiring is exercised without an API call.
+    orig_avail, orig_judge = p.live_generation_available, p.judge_faithfulness
+    p.live_generation_available = lambda: (True, "")
+    p.judge_faithfulness = lambda draft, brief: p.FaithfulnessVerdict(True, [], 7, "stub")
+    try:
+        _, rounds = p.run_pipeline(YOUR, PRODUCT, CLIENT, CONTACT, NOTES,
+                                   "Clean memo (passes first round)", use_judge=True)
+    finally:
+        p.live_generation_available, p.judge_faithfulness = orig_avail, orig_judge
+    _, ev = rounds[0]
+    assert any(r.id == "faithfulness" for r in ev.results)
+
+
 def test_loop_converges_for_each_single_flaw():
     for scenario in ("Invents commitments not in the notes",
                      "Generic, ignores the meeting",

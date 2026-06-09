@@ -29,6 +29,11 @@
       notes now; context-graph grounding deferred.
 - [x] `build_decision_trace(...)`: every evaluation emits a durable trace meant
       to feed the context graph's event clock. Shown as JSON in the UI.
+- [x] Independent LLM faithfulness judge (`judge_faithfulness`): an optional 6th
+      criterion (live only) -- a separate Gemini call reads the memo vs the notes
+      and flags semantic over-claims the figure check can't. Writer/checker
+      separation; its tokens count toward the cost ceiling; degrades to deferred
+      (non-blocking) when unavailable. UI toggle. Tested with injected verdicts.
 - [x] README, AGENTS.md, requirements.txt, this progress file.
 
 ## To enable live mode

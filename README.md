@@ -88,6 +88,10 @@ memo does not get to approve its own work.
   3. **No fabrication** — every figure traces back to the notes; no invented commitments or products (the hallucination guard).
   4. **Clear next steps** — restates the agreed next steps.
   5. **Format** — has a subject line and stays within the word budget.
+- Optional 6th criterion (live only): an **independent LLM faithfulness judge**
+  (`judge_faithfulness`) — a separate Gemini call that reads the memo against the
+  notes and flags semantic over-claims the figure check can't. Writer/checker
+  separation; its tokens count toward the cost ceiling; non-blocking if deferred.
 - The generator gets no vote; the evaluator alone decides whether a memo is done.
 
 ### 4. Feedback loop (`gtm_pipeline.py`)

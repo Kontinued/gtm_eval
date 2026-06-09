@@ -39,6 +39,14 @@ if use_live and not live_ok:
 elif live_ok:
     st.caption(f"Live agent ready ({pipeline.GEMINI_MODEL}).")
 
+use_judge = st.toggle(
+    "Add LLM faithfulness judge (independent checker)", value=False,
+    disabled=not (use_live and live_ok),
+    help="A second, independent Gemini call reads the memo against the notes and "
+         "flags claims they don't support -- catches semantic over-claims the "
+         "figure check can't. Live mode only; its tokens count toward the ceiling.",
+)
+
 ceiling = st.number_input("Cost ceiling (max tokens, 0 = none)", min_value=0, value=0, step=500)
 
 scenario = st.selectbox(
@@ -58,7 +66,7 @@ if st.button("Run pipeline"):
     brief, rounds = pipeline.run_pipeline(
         your_company, product, client_company, client_contact,
         meeting_notes, scenario, max_rounds=3, use_live=use_live,
-        token_budget=(ceiling or None),
+        token_budget=(ceiling or None), use_judge=use_judge,
     )
 
     # Planner output: the brief / contract.

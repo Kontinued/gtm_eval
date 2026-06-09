@@ -32,6 +32,7 @@ graph is still deferred (see ground()).
 
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
+import json
 import os
 import re
 
@@ -411,8 +412,12 @@ def _has_next_steps(text):
     return any(re.search(p, low) for p in _NEXT_STEPS_PATTERNS)
 
 
-def evaluate_draft(draft, brief):
-    """Score a memo against the brief. Each criterion is a hard threshold."""
+def evaluate_draft(draft, brief, faithfulness=None):
+    """Score a memo against the brief. Each criterion is a hard threshold.
+
+    The five deterministic criteria always run. If `faithfulness` (a
+    FaithfulnessVerdict from the independent LLM judge) is provided, a sixth
+    criterion is added; a deferred/None verdict is non-blocking."""
     text = draft.text
     low = text.lower()
     results = []
@@ -472,6 +477,23 @@ def evaluate_draft(draft, brief):
         fb = "Memo is " + " and ".join(parts) + "."
     results.append(CriterionResult("format", "Complete and concise", ok, fb))
 
+    # 6. Faithfulness (independent LLM judge) -- only when a verdict was produced.
+    if faithfulness is not None:
+        if faithfulness.supported is False:
+            shown = "; ".join(
+                (c.get("claim", "") if isinstance(c, dict) else str(c))
+                for c in faithfulness.unsupported_claims[:3])
+            fb = f"LLM judge flagged unsupported claim(s): {shown}."
+            passed = False
+        elif faithfulness.supported is True:
+            fb = "LLM judge: every claim traces to the meeting notes."
+            passed = True
+        else:  # None -> deferred (model unavailable / error); non-blocking
+            fb = f"LLM faithfulness judge deferred ({faithfulness.note})."
+            passed = True
+        results.append(CriterionResult(
+            "faithfulness", "Faithful to the meeting (LLM judge)", passed, fb))
+
     return Evaluation(results=results)
 
 
@@ -521,6 +543,69 @@ def gather_grounding(draft, brief):
     return [ground(claim, brief) for claim in extract_claims(draft, brief)]
 
 
+# ---------------------------------------------------------------------------
+# Faithfulness: an independent LLM judge (writer/checker separation)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FaithfulnessVerdict:
+    """An independent LLM judge's check of the memo against the meeting notes."""
+    supported: bool | None        # False = unsupported claims found; None = deferred
+    unsupported_claims: list      # [{claim, why}]
+    tokens: int                   # counts toward the cost ceiling
+    note: str
+
+
+_JUDGE_SYSTEM = (
+    "You are a strict reviewer checking a client follow-up memo against the "
+    "meeting notes. Your only job is to find statements in the memo that are NOT "
+    "supported by the notes: invented commitments, dates, figures, outcomes, or "
+    "claims that assert more than the notes say. Be skeptical -- if a statement "
+    "goes beyond the notes, flag it. Do not reward good writing; judge only "
+    "faithfulness to the notes. Respond ONLY with JSON of the form "
+    '{"supported": true|false, "unsupported_claims": [{"claim": "...", "why": "..."}]}.'
+)
+
+
+def judge_faithfulness(draft, brief):
+    """Independent LLM judge: does every claim in the memo trace to the notes?
+
+    A separate model call from the generator -- the harness's "person who checks
+    is not the person who does." Returns a FaithfulnessVerdict; degrades to
+    supported=None (deferred) if the live model is unavailable or the call/parse
+    fails, so it never crashes the pipeline. Semantic, so it catches over-claims
+    the deterministic figure check (ground()) cannot."""
+    if not live_generation_available()[0]:
+        return FaithfulnessVerdict(None, [], 0, "live model unavailable; deferred")
+    try:
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(
+            api_key=os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
+        prompt = ("MEETING NOTES (the only source of truth):\n" + brief.meeting_notes
+                  + "\n\nMEMO TO REVIEW:\n" + draft.text)
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=_JUDGE_SYSTEM,
+                temperature=0.0,
+                response_mime_type="application/json",
+                max_output_tokens=1024,
+            ),
+        )
+        usage = getattr(response, "usage_metadata", None)
+        tokens = getattr(usage, "total_token_count", 0) or 0
+        data = json.loads(response.text or "{}")
+        claims = data.get("unsupported_claims") or []
+        supported = bool(data.get("supported", not claims)) and not claims
+        return FaithfulnessVerdict(supported, claims, tokens,
+                                   "judged by an independent LLM against the notes")
+    except Exception as exc:  # noqa: BLE001 - judge failures degrade, never crash
+        return FaithfulnessVerdict(None, [], 0, f"judge error: {type(exc).__name__}")
+
+
 def build_decision_trace(brief, draft, evaluation, timestamp=None):
     """Assemble the durable decision trace for one evaluated memo."""
     ts = timestamp or datetime.now(timezone.utc).isoformat()
@@ -557,20 +642,27 @@ def _apply_feedback(active_defects, evaluation):
 
 
 def run_pipeline(your_company, product, client_company, client_contact,
-                 meeting_notes, scenario, max_rounds=3, use_live=False, token_budget=None):
+                 meeting_notes, scenario, max_rounds=3, use_live=False,
+                 token_budget=None, use_judge=False):
     """Run the full loop. Returns (brief, rounds) where rounds is a list of
     (Draft, Evaluation) pairs, one per generate-and-evaluate cycle.
 
     Two stop conditions (the GTM005 verifier-loop requirement): `max_rounds`
     caps the number of attempts, and `token_budget` is a cost ceiling -- once the
-    cumulative tokens spent reach it, the loop stops even if not yet passing."""
+    cumulative tokens spent (generation + judge) reach it, the loop stops even if
+    not yet passing. `use_judge` adds the independent LLM faithfulness judge when
+    the live model is available; its tokens count toward the ceiling."""
     brief = plan_brief(your_company, product, client_company, client_contact, meeting_notes)
     history = []
     tokens_used = 0
     for _ in range(max_rounds):
         draft = generate_draft(brief, history, scenario, use_live=use_live)
         tokens_used += draft.tokens
-        evaluation = evaluate_draft(draft, brief)
+        verdict = None
+        if use_judge and live_generation_available()[0]:
+            verdict = judge_faithfulness(draft, brief)
+            tokens_used += verdict.tokens
+        evaluation = evaluate_draft(draft, brief, faithfulness=verdict)
         stalled = bool(history) and draft.text == history[-1][0].text
         history.append((draft, evaluation))
         if evaluation.passed or stalled:
