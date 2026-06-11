@@ -128,6 +128,7 @@ class CriterionResult:
 class Evaluation:
     """Evaluator output: per-criterion results plus the overall gate."""
     results: list  # list[CriterionResult]
+    tokens: int = 0  # tokens the LLM judge spent this round (0 if no judge ran)
 
     @property
     def passed(self):
@@ -174,6 +175,7 @@ class DecisionTrace:
     draft_round: int
     draft_source: str
     score: int
+    tokens: int          # generation + judge tokens for this round
     criteria: list       # [{id, passed, feedback}]
     grounding: list      # [{claim, supported, source, note}]
     rationale: str
@@ -494,7 +496,8 @@ def evaluate_draft(draft, brief, faithfulness=None):
         results.append(CriterionResult(
             "faithfulness", "Faithful to the meeting (LLM judge)", passed, fb))
 
-    return Evaluation(results=results)
+    judge_tokens = faithfulness.tokens if faithfulness else 0
+    return Evaluation(results=results, tokens=judge_tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -620,6 +623,7 @@ def build_decision_trace(brief, draft, evaluation, timestamp=None):
         draft_round=draft.round,
         draft_source=draft.source,
         score=evaluation.score,
+        tokens=draft.tokens + evaluation.tokens,
         criteria=[{"id": r.id, "passed": r.passed, "feedback": r.feedback}
                   for r in evaluation.results],
         grounding=[asdict(g) for g in gather_grounding(draft, brief)],

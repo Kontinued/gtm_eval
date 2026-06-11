@@ -192,6 +192,25 @@ def test_run_pipeline_runs_judge_when_enabled():
     assert any(r.id == "faithfulness" for r in ev.results)
 
 
+def test_mock_draft_reports_estimated_tokens():
+    _, draft, _ = _eval_for("Clean memo (passes first round)")
+    assert draft.tokens > 0
+
+
+def test_evaluation_carries_judge_tokens():
+    brief, draft, _ = _eval_for("Clean memo (passes first round)")
+    assert p.evaluate_draft(draft, brief).tokens == 0           # no judge
+    v = p.FaithfulnessVerdict(True, [], 9, "t")
+    assert p.evaluate_draft(draft, brief, faithfulness=v).tokens == 9
+
+
+def test_decision_trace_includes_token_total():
+    brief, draft, ev = _eval_for("Clean memo (passes first round)")
+    trace = p.build_decision_trace(brief, draft, ev)
+    assert trace.tokens == draft.tokens + ev.tokens
+    assert trace.tokens > 0
+
+
 def test_loop_converges_for_each_single_flaw():
     for scenario in ("Invents commitments not in the notes",
                      "Generic, ignores the meeting",
